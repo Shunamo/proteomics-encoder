@@ -1,3 +1,14 @@
+# Sync Commits to Central Hub
+# 
+# This workflow runs on every push and updates the central Gene-Brain hub
+# with the latest commit metadata from this project repository.
+#
+# SETUP:
+# 1. Copy this file to your project repo's .github/workflows/ directory
+# 2. Create a secret named BIG_REPO_TOKEN with a PAT that has write access
+#    to the central repo (allison-eunse/gene-brain)
+# 3. Optionally, update BIG_REPO below if the central repo name changes
+
 name: Sync Commits to Central
 
 on:
@@ -6,112 +17,99 @@ on:
       - main
       - master
 
+env:
+  BIG_REPO: allison-eunse/gene-brain
+  ROLLING_WINDOW: 50
+
 jobs:
-  sync-commits:
+  sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout repository
+      - name: Checkout this repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 50  # 최근 50개 커밋만 가져오기
+          fetch-depth: ${{ env.ROLLING_WINDOW }}
 
-      - name: Get commit metadata
-        id: commits
+      - name: Generate commits.json
+        id: generate
         run: |
-          # 최근 50개 커밋 정보 추출
-          COMMITS_JSON=$(git log -50 --pretty=format:'{"sha_short":"%h","message":"%s","committed_at":"%aI"},' | sed 's/,$//')
+          # Compute KEY from GitHub context
+          KEY="${GITHUB_REPOSITORY_OWNER}__${GITHUB_REPOSITORY#*/}"
+          echo "KEY=$KEY" >> $GITHUB_OUTPUT
           
-          # 커밋 메시지 처리 (1줄만, 최대 120자, 특수문자 이스케이프)
-          COMMITS_JSON=$(echo "$COMMITS_JSON" | python3 << 'PYTHON'
+          python3 - <<'PY'
           import json
-          import sys
-          import re
+          import os
+          import subprocess
+          from datetime import datetime
           
-          commits_str = sys.stdin.read()
-          if commits_str.strip():
-              # JSON 배열로 변환
-              commits_list = json.loads('[' + commits_str + ']')
-              
-              # 각 커밋 메시지 처리
-              for commit in commits_list:
-                  # 첫 줄만 추출 (개행 제거)
-                  msg = commit['message'].split('\n')[0]
-                  # 최대 120자로 제한
-                  msg = msg[:120]
-                  # JSON 이스케이프
-                  commit['message'] = msg
-              
-              print(json.dumps(commits_list, ensure_ascii=False))
-          else:
-              print('[]')
-          PYTHON
+          rolling = int(os.environ.get("ROLLING_WINDOW", "50"))
+          fmt = "%h%x1f%s%x1f%aI"
+          out = subprocess.check_output(
+              ["git", "log", "-n", str(rolling), f"--pretty=format:{fmt}"],
+              text=True
           )
           
-          echo "commits_json<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS_JSON" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          commits = []
+          for line in out.splitlines():
+              sha, msg, ts = line.split("\x1f")
+              msg = msg.replace("\n", " ").strip()[:120]
+              commits.append({
+                  "sha_short": sha,
+                  "message": msg,
+                  "committed_at": ts
+              })
           
-          # Owner와 Repo 추출
-          OWNER="${GITHUB_REPOSITORY_OWNER}"
-          REPO="${GITHUB_REPOSITORY#*/}"
-          KEY="${OWNER}__${REPO}"
-          
-          echo "owner=$OWNER" >> $GITHUB_OUTPUT
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "key=$KEY" >> $GITHUB_OUTPUT
-
-      - name: Prepare commits.json
-        id: prepare
-        run: |
-          OWNER="${{ steps.commits.outputs.owner }}"
-          REPO="${{ steps.commits.outputs.repo }}"
-          KEY="${{ steps.commits.outputs.key }}"
-          UPDATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          
-          # 최종 JSON 생성
-          cat > commits.json << EOF
-          {
-            "owner": "${OWNER}",
-            "repo": "${REPO}",
-            "updated_at": "${UPDATED_AT}",
-            "commits": ${{ steps.commits.outputs.commits_json }}
+          payload = {
+              "owner": os.environ["GITHUB_REPOSITORY_OWNER"],
+              "repo": os.environ["GITHUB_REPOSITORY"].split("/", 1)[1],
+              "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "commits": commits
           }
-          EOF
           
-          echo "data_dir=site/data/${KEY}" >> $GITHUB_OUTPUT
+          with open("commits.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, ensure_ascii=False, indent=2)
+          PY
+          
+          echo "Generated commits.json:"
           cat commits.json
 
-      - name: Push to central repository
-        env:
-          BIG_REPO_TOKEN: ${{ secrets.BIG_REPO_TOKEN }}
+      - name: Clone central repo
         run: |
-          CENTRAL_REPO="allison-eunse/gene-brain"
-          DATA_DIR="${{ steps.prepare.outputs.data_dir }}"
-          
-          # Check if token is set
-          if [ -z "$BIG_REPO_TOKEN" ]; then
-            echo "Error: BIG_REPO_TOKEN is not set"
-            exit 1
-          fi
-          
-          # Clone central repo with token
-          git clone --depth 1 "https://${BIG_REPO_TOKEN}@github.com/${CENTRAL_REPO}.git" central-repo
+          git clone --depth=1 https://x-access-token:${{ secrets.BIG_REPO_TOKEN }}@github.com/${{ env.BIG_REPO }}.git central-repo
+
+      - name: Update commits in central repo
+        run: |
+          KEY="${{ steps.generate.outputs.KEY }}"
+          mkdir -p central-repo/site/data/$KEY
+          cp commits.json central-repo/site/data/$KEY/commits.json
+
+      - name: Commit and push to central repo
+        run: |
           cd central-repo
-          
-          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Copy commit data
-          mkdir -p "$DATA_DIR"
-          cp "../commits.json" "$DATA_DIR/commits.json"
+          git add site/data/
           
-          # Commit and push (with token in remote URL)
-          git add "$DATA_DIR/commits.json"
-          git commit -m "chore: sync commits from ${{ steps.commits.outputs.key }} [skip ci]" || exit 0
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
           
-          # Update remote URL with token for push
-          git remote set-url origin https://${BIG_REPO_TOKEN}@github.com/${CENTRAL_REPO}.git
-          git push origin main || git push origin master
+          KEY="${{ steps.generate.outputs.KEY }}"
+          git commit -m "chore: update commits for $KEY"
+          
+          # Retry logic for concurrent pushes
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if git push; then
+              echo "Push successful"
+              exit 0
+            fi
+            echo "Push failed, retrying ($i/$MAX_RETRIES)..."
+            git pull --rebase
+          done
+          
+          echo "Failed to push after $MAX_RETRIES retries"
+          exit 1
