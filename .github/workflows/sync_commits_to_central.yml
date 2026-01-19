@@ -90,8 +90,14 @@ jobs:
           CENTRAL_REPO="allison-eunse/gene-brain"
           DATA_DIR="${{ steps.prepare.outputs.data_dir }}"
           
-          # Clone central repo
-          git clone --depth 1 https://${BIG_REPO_TOKEN}@github.com/${CENTRAL_REPO}.git central-repo
+          # Check if token is set
+          if [ -z "$BIG_REPO_TOKEN" ]; then
+            echo "Error: BIG_REPO_TOKEN is not set"
+            exit 1
+          fi
+          
+          # Clone central repo with token
+          git clone --depth 1 "https://${BIG_REPO_TOKEN}@github.com/${CENTRAL_REPO}.git" central-repo
           cd central-repo
           
           # Configure git
