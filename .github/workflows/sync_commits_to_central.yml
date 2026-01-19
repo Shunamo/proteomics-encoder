@@ -15,54 +15,80 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 50  # 최근 50개 커밋만 가져오기
 
-      - name: Get latest commit info
-        id: commit-info
+      - name: Get commit metadata
+        id: commits
         run: |
-          COMMIT_SHA=$(git rev-parse --short HEAD)
-          COMMIT_MSG=$(git log -1 --pretty=format:"%s" | head -c 120)
-          COMMIT_TIME=$(git log -1 --pretty=format:"%aI")
+          # 최근 50개 커밋 정보 추출
+          COMMITS_JSON=$(git log -50 --pretty=format:'{"sha_short":"%h","message":"%s","committed_at":"%aI"},' | sed 's/,$//')
           
-          echo "sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
-          echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
-          echo "timestamp=$COMMIT_TIME" >> $GITHUB_OUTPUT
+          # 커밋 메시지 처리 (1줄만, 최대 120자, 특수문자 이스케이프)
+          COMMITS_JSON=$(echo "$COMMITS_JSON" | python3 << 'PYTHON'
+          import json
+          import sys
+          import re
           
-          echo "Commit SHA: $COMMIT_SHA"
-          echo "Commit Message: $COMMIT_MSG"
-          echo "Commit Time: $COMMIT_TIME"
+          commits_str = sys.stdin.read()
+          if commits_str.strip():
+              # JSON 배열로 변환
+              commits_list = json.loads('[' + commits_str + ']')
+              
+              # 각 커밋 메시지 처리
+              for commit in commits_list:
+                  # 첫 줄만 추출 (개행 제거)
+                  msg = commit['message'].split('\n')[0]
+                  # 최대 120자로 제한
+                  msg = msg[:120]
+                  # JSON 이스케이프
+                  commit['message'] = msg
+              
+              print(json.dumps(commits_list, ensure_ascii=False))
+          else:
+              print('[]')
+          PYTHON
+          )
+          
+          echo "commits_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS_JSON" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Owner와 Repo 추출
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          KEY="${OWNER}__${REPO}"
+          
+          echo "owner=$OWNER" >> $GITHUB_OUTPUT
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "key=$KEY" >> $GITHUB_OUTPUT
 
-      - name: Prepare commit data
-        id: prepare-data
+      - name: Prepare commits.json
+        id: prepare
         run: |
-          REPO_OWNER="Shunamo"
-          REPO_NAME="proteomics-encoder"
-          DATA_DIR="site/data/${REPO_OWNER}__${REPO_NAME}"
+          OWNER="${{ steps.commits.outputs.owner }}"
+          REPO="${{ steps.commits.outputs.repo }}"
+          KEY="${{ steps.commits.outputs.key }}"
+          UPDATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           
-          mkdir -p "$DATA_DIR"
-          
-          cat > "$DATA_DIR/commits.json" << EOF
+          # 최종 JSON 생성
+          cat > commits.json << EOF
           {
-            "owner": "$REPO_OWNER",
-            "repo": "$REPO_NAME",
-            "latest_commit": {
-              "sha": "${{ steps.commit-info.outputs.sha }}",
-              "message": "${{ steps.commit-info.outputs.message }}",
-              "timestamp": "${{ steps.commit-info.outputs.timestamp }}"
-            },
-            "updated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            "owner": "${OWNER}",
+            "repo": "${REPO}",
+            "updated_at": "${UPDATED_AT}",
+            "commits": ${{ steps.commits.outputs.commits_json }}
           }
           EOF
           
-          echo "data_dir=$DATA_DIR" >> $GITHUB_OUTPUT
-          cat "$DATA_DIR/commits.json"
+          echo "data_dir=site/data/${KEY}" >> $GITHUB_OUTPUT
+          cat commits.json
 
       - name: Push to central repository
         env:
           GITHUB_TOKEN: ${{ secrets.BIG_REPO_TOKEN }}
         run: |
           CENTRAL_REPO="allison-eunse/gene-brain"
-          DATA_DIR="${{ steps.prepare-data.outputs.data_dir }}"
+          DATA_DIR="${{ steps.prepare.outputs.data_dir }}"
           
           # Clone central repo
           git clone --depth 1 https://${GITHUB_TOKEN}@github.com/${CENTRAL_REPO}.git central-repo
@@ -74,9 +100,9 @@ jobs:
           
           # Copy commit data
           mkdir -p "$DATA_DIR"
-          cp "../$DATA_DIR/commits.json" "$DATA_DIR/"
+          cp "../commits.json" "$DATA_DIR/commits.json"
           
           # Commit and push
           git add "$DATA_DIR/commits.json"
-          git commit -m "chore: sync commits from Shunamo/proteomics-encoder [skip ci]" || exit 0
+          git commit -m "chore: sync commits from ${{ steps.commits.outputs.key }} [skip ci]" || exit 0
           git push
