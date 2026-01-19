@@ -1,0 +1,82 @@
+name: Sync Commits to Central
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  sync-commits:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get latest commit info
+        id: commit-info
+        run: |
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s" | head -c 120)
+          COMMIT_TIME=$(git log -1 --pretty=format:"%aI")
+          
+          echo "sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          echo "timestamp=$COMMIT_TIME" >> $GITHUB_OUTPUT
+          
+          echo "Commit SHA: $COMMIT_SHA"
+          echo "Commit Message: $COMMIT_MSG"
+          echo "Commit Time: $COMMIT_TIME"
+
+      - name: Prepare commit data
+        id: prepare-data
+        run: |
+          REPO_OWNER="Shunamo"
+          REPO_NAME="proteomics-encoder"
+          DATA_DIR="site/data/${REPO_OWNER}__${REPO_NAME}"
+          
+          mkdir -p "$DATA_DIR"
+          
+          cat > "$DATA_DIR/commits.json" << EOF
+          {
+            "owner": "$REPO_OWNER",
+            "repo": "$REPO_NAME",
+            "latest_commit": {
+              "sha": "${{ steps.commit-info.outputs.sha }}",
+              "message": "${{ steps.commit-info.outputs.message }}",
+              "timestamp": "${{ steps.commit-info.outputs.timestamp }}"
+            },
+            "updated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          
+          echo "data_dir=$DATA_DIR" >> $GITHUB_OUTPUT
+          cat "$DATA_DIR/commits.json"
+
+      - name: Push to central repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.BIG_REPO_TOKEN }}
+        run: |
+          CENTRAL_REPO="allison-eunse/gene-brain"
+          DATA_DIR="${{ steps.prepare-data.outputs.data_dir }}"
+          
+          # Clone central repo
+          git clone --depth 1 https://${GITHUB_TOKEN}@github.com/${CENTRAL_REPO}.git central-repo
+          cd central-repo
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Copy commit data
+          mkdir -p "$DATA_DIR"
+          cp "../$DATA_DIR/commits.json" "$DATA_DIR/"
+          
+          # Commit and push
+          git add "$DATA_DIR/commits.json"
+          git commit -m "chore: sync commits from Shunamo/proteomics-encoder [skip ci]" || exit 0
+          git push
